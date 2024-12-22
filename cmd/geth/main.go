@@ -65,6 +65,13 @@ var (
 		utils.OverrideCancun,
 		utils.OverrideVerkle,
 		utils.EnablePersonal, // deprecated
+		utils.IndexerEnabledFlag,
+		utils.IndexerHostFlag,
+		utils.IndexerPortFlag,
+		utils.IndexerUserFlag,
+		utils.IndexerPasswordFlag,
+		utils.IndexerDBNameFlag,
+		utils.IndexerSSLModeFlag,
 		utils.TxPoolLocalsFlag,
 		utils.TxPoolNoLocalsFlag,
 		utils.TxPoolJournalFlag,
