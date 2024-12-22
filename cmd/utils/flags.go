@@ -928,6 +928,49 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Value:    metrics.DefaultConfig.InfluxDBOrganization,
 		Category: flags.MetricsCategory,
 	}
+
+	// Indexer settings
+	IndexerEnabledFlag = &cli.BoolFlag{
+		Name:     "indexer",
+		Usage:    "Enable the PostgreSQL indexer",
+		Category: flags.EthCategory,
+	}
+	IndexerHostFlag = &cli.StringFlag{
+		Name:     "indexer.host",
+		Usage:    "PostgreSQL host",
+		Value:    "localhost",
+		Category: flags.EthCategory,
+	}
+	IndexerPortFlag = &cli.IntFlag{
+		Name:     "indexer.port",
+		Usage:    "PostgreSQL port",
+		Value:    5432,
+		Category: flags.EthCategory,
+	}
+	IndexerUserFlag = &cli.StringFlag{
+		Name:     "indexer.user",
+		Usage:    "PostgreSQL user",
+		Value:    "postgres",
+		Category: flags.EthCategory,
+	}
+	IndexerPasswordFlag = &cli.StringFlag{
+		Name:     "indexer.password",
+		Usage:    "PostgreSQL password",
+		Value:    "postgres",
+		Category: flags.EthCategory,
+	}
+	IndexerDBNameFlag = &cli.StringFlag{
+		Name:     "indexer.dbname",
+		Usage:    "PostgreSQL database name",
+		Value:    "geth_indexer",
+		Category: flags.EthCategory,
+	}
+	IndexerSSLModeFlag = &cli.StringFlag{
+		Name:     "indexer.sslmode",
+		Usage:    "PostgreSQL SSL mode (disable, require, verify-ca, verify-full)",
+		Value:    "disable",
+		Category: flags.EthCategory,
+	}
 )
 
 var (
@@ -1834,6 +1877,16 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			cfg.VMTraceJsonConfig = ctx.String(VMTraceJsonConfigFlag.Name)
 		}
 	}
+	if ctx.IsSet("indexer.host") {
+		cfg.IndexerConfig = &core.IndexerConfig{
+			Host:     ctx.String("indexer.host"),
+			Port:     ctx.Int("indexer.port"),
+			User:     ctx.String("indexer.user"),
+			Password: ctx.String("indexer.password"),
+			DBName:   ctx.String("indexer.dbname"),
+			SSLMode:  ctx.String("indexer.sslmode"),
+		}
+	}
 }
 
 // MakeBeaconLightConfig constructs a beacon light client config based on the
@@ -1926,8 +1979,9 @@ func SetDNSDiscoveryDefaults(cfg *ethconfig.Config, genesis common.Hash) {
 
 // RegisterEthService adds an Ethereum client to the stack.
 // The second return value is the full node instance.
-func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (*eth.EthAPIBackend, *eth.Ethereum) {
-	backend, err := eth.New(stack, cfg)
+func RegisterEthService(stack *node.Node, cfg *ethconfig.Config, indexerPlugin *core.IndexerPlugin) (*eth.EthAPIBackend, *eth.Ethereum) {
+	// Create Ethereum backend with the provided plugin
+	backend, err := eth.New(stack, cfg, indexerPlugin)
 	if err != nil {
 		Fatalf("Failed to register the Ethereum service: %v", err)
 	}
@@ -2185,7 +2239,9 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		}
 	}
 	// Disable transaction indexing/unindexing by default.
-	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vmcfg, nil)
+	db := MakeIndexerDB(ctx)
+	indexer := core.NewIndexerPlugin(db)
+	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vmcfg, nil, indexer)
 	if err != nil {
 		Fatalf("Can't create BlockChain: %v", err)
 	}
@@ -2232,4 +2288,28 @@ func MakeTrieDatabase(ctx *cli.Context, disk ethdb.Database, preimage bool, read
 		config.PathDB = pathdb.Defaults
 	}
 	return triedb.NewDatabase(disk, config)
+}
+
+// MakeIndexerDB creates a database connection for the indexer plugin
+func MakeIndexerDB(ctx *cli.Context) *core.IndexerDB {
+	// Only create indexer DB if host is specified
+	if !ctx.IsSet(IndexerHostFlag.Name) {
+		return nil
+	}
+
+	config := core.IndexerConfig{
+		Host:     ctx.String(IndexerHostFlag.Name),
+		Port:     ctx.Int(IndexerPortFlag.Name),
+		DBName:   ctx.String(IndexerDBNameFlag.Name),
+		User:     ctx.String(IndexerUserFlag.Name),
+		Password: ctx.String(IndexerPasswordFlag.Name),
+		SSLMode:  ctx.String(IndexerSSLModeFlag.Name),
+	}
+
+	db, err := core.NewDB(config)
+	if err != nil {
+		log.Error("Failed to connect to indexer database", "error", err)
+		return nil
+	}
+	return db
 }

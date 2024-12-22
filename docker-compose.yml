@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  geth:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jwt-init:
+        condition: service_completed_successfully
+    command: >
+      --http
+      --http.addr 0.0.0.0
+      --http.vhosts=*
+      --http.api eth,net,engine,admin
+      --ws
+      --ws.addr 0.0.0.0
+      --syncmode full
+      --gcmode archive
+      --cache 8192
+      --cache.gc 0
+      --txlookuplimit 0
+      --db.engine pebble
+      --state.scheme path
+      --authrpc.addr 0.0.0.0
+      --authrpc.port 8551
+      --authrpc.vhosts "*"
+      --authrpc.jwtsecret /jwt/jwt.hex
+      --bootnodes "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303,enode://22a8232c3abc76a16ae9d6c3b164f98775fe226f0917b0ca871128a74a8e9630b458460865bab457221f1d448dd9791d24c4e5d88786180ac185df813a68d4de@3.209.45.79:30303"
+      --maxpeers 100
+      --indexer
+      --indexer.host postgres
+      --indexer.port 5432
+      --indexer.user postgres
+      --indexer.password postgres
+      --indexer.dbname ethereum
+      --indexer.sslmode disable
+    volumes:
+      - geth-data:/root/.ethereum
+      - jwt:/jwt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "geth attach --exec eth.blockNumber http://localhost:8545"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  jwt-init:
+    image: alpine:latest
+    restart: "no"
+    volumes:
+      - jwt:/jwt
+    command: >
+      sh -c "
+        if [ -f /jwt/jwt.hex ]; then
+          echo 'JWT file already exists'
+          exit 0
+        fi &&
+        apk add --no-cache openssl &&
+        openssl rand -hex 32 > /jwt/jwt.hex &&
+        chmod 644 /jwt/jwt.hex &&
+        ls -l /jwt/jwt.hex &&
+        cat /jwt/jwt.hex &&
+        echo 'JWT file created successfully' &&
+        exit 0"
+
+  lighthouse:
+    image: sigp/lighthouse:${LIGHTHOUSE_VERSION:-latest}
+    command: >
+      sh -c "ls -l /jwt/jwt.hex && cat /jwt/jwt.hex &&
+      lighthouse
+      beacon_node
+      --network mainnet
+      --execution-endpoint http://geth:8551
+      --execution-jwt /jwt/jwt.hex
+      --checkpoint-sync-url https://beaconstate.ethstaker.cc
+      --http
+      --http-address 0.0.0.0
+      --http-port 5052
+      --port 9000
+      --discovery-port 9000
+      --target-peers 100
+      --boot-nodes "enr:-KG4QOtcP9X1FbIMOe17QNMKqDxCpm14jcX5tiOE4_TyMrFqbmhPZHK_ZPG2Gxb1GE2xdtodOfx9-cgvNtxnRyHEmC0ghGV0aDKQ9aX9QgAAAAD__________4JpZIJ2NIJpcIQDE8KdiXNlY3AyNTZrMaEDhpehBDbZjM_L9ek699Y7vhUJ-eAdMyQW_Fil522Y0fODdGNwgiMog3VkcIIjKA"
+      --metrics
+      --metrics-address 0.0.0.0
+      --metrics-port 5054
+      --debug-level info"
+    ports:
+      - "5052:5052/tcp"
+      - "5053:5053/tcp"
+      - "5054:5054/tcp"
+      - "9000:9000/tcp"
+      - "9000:9000/udp"
+    volumes:
+      - lighthouse-data:/root/.lighthouse
+      - jwt:/jwt:ro
+    depends_on:
+      geth:
+        condition: service_started
+      jwt-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=ethereum
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  geth-data:
+  lighthouse-data:
+  postgres-data:
+  jwt:

@@ -36,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/eth/catalyst"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/internal/flags"
@@ -195,7 +196,27 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 	// Start metrics export if enabled
 	utils.SetupMetrics(&cfg.Metrics)
 
-	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
+	// Create indexer plugin if enabled
+	var indexerPlugin *core.IndexerPlugin
+	if ctx.Bool(utils.IndexerEnabledFlag.Name) {
+		indexerConfig := core.IndexerConfig{
+			Host:     ctx.String(utils.IndexerHostFlag.Name),
+			Port:     ctx.Int(utils.IndexerPortFlag.Name),
+			User:     ctx.String(utils.IndexerUserFlag.Name),
+			Password: ctx.String(utils.IndexerPasswordFlag.Name),
+			DBName:   ctx.String(utils.IndexerDBNameFlag.Name),
+			SSLMode:  ctx.String(utils.IndexerSSLModeFlag.Name),
+		}
+
+		db, err := core.NewDB(indexerConfig)
+		if err != nil {
+			utils.Fatalf("Failed to create indexer db: %v", err)
+		}
+		indexerPlugin = core.NewIndexerPlugin(db)
+	}
+
+	// Register Ethereum service with optional indexer plugin
+	backend, eth := utils.RegisterEthService(stack, &cfg.Eth, indexerPlugin)
 
 	// Create gauge with geth system and build information
 	if eth != nil { // The 'eth' backend may be nil in light mode
@@ -211,17 +232,19 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 		})
 	}
 
-	// Configure log filter RPC API.
+	// Configure log filter RPC API
 	filterSystem := utils.RegisterFilterAPI(stack, backend, &cfg.Eth)
 
-	// Configure GraphQL if requested.
+	// Configure GraphQL if requested
 	if ctx.IsSet(utils.GraphQLEnabledFlag.Name) {
 		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
 	}
-	// Add the Ethereum Stats daemon if requested.
+
+	// Add the Ethereum Stats daemon if requested
 	if cfg.Ethstats.URL != "" {
 		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
 	}
+
 	// Configure full-sync tester service if requested
 	if ctx.IsSet(utils.SyncTargetFlag.Name) {
 		hex := hexutil.MustDecode(ctx.String(utils.SyncTargetFlag.Name))
@@ -232,7 +255,7 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 	}
 
 	if ctx.IsSet(utils.DeveloperFlag.Name) {
-		// Start dev mode.
+		// Start dev mode
 		simBeacon, err := catalyst.NewSimulatedBeacon(ctx.Uint64(utils.DeveloperPeriodFlag.Name), eth)
 		if err != nil {
 			utils.Fatalf("failed to register dev mode catalyst service: %v", err)
@@ -240,19 +263,20 @@ func makeFullNode(ctx *cli.Context) *node.Node {
 		catalyst.RegisterSimulatedBeaconAPIs(stack, simBeacon)
 		stack.RegisterLifecycle(simBeacon)
 	} else if ctx.IsSet(utils.BeaconApiFlag.Name) {
-		// Start blsync mode.
+		// Start blsync mode
 		srv := rpc.NewServer()
 		srv.RegisterName("engine", catalyst.NewConsensusAPI(eth))
 		blsyncer := blsync.NewClient(utils.MakeBeaconLightConfig(ctx))
 		blsyncer.SetEngineRPC(rpc.DialInProc(srv))
 		stack.RegisterLifecycle(blsyncer)
 	} else {
-		// Launch the engine API for interacting with external consensus client.
+		// Launch the engine API for interacting with external consensus client
 		err := catalyst.Register(stack, eth)
 		if err != nil {
 			utils.Fatalf("failed to register catalyst service: %v", err)
 		}
 	}
+
 	return stack
 }
 

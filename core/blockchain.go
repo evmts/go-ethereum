@@ -259,12 +259,13 @@ type BlockChain struct {
 	processor  Processor // Block transaction processor interface
 	vmConfig   vm.Config
 	logger     *tracing.Hooks
+	plugin     *IndexerPlugin // Optional plugin for indexing (nil if not configured)
 }
 
 // NewBlockChain returns a fully initialised block chain using information
 // available in the database. It initialises the default Ethereum Validator
 // and Processor.
-func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis, overrides *ChainOverrides, engine consensus.Engine, vmConfig vm.Config, txLookupLimit *uint64) (*BlockChain, error) {
+func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis, overrides *ChainOverrides, engine consensus.Engine, vmConfig vm.Config, txLookupLimit *uint64, plugin *IndexerPlugin) (*BlockChain, error) {
 	if cacheConfig == nil {
 		cacheConfig = defaultCacheConfig
 	}
@@ -302,6 +303,7 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis
 		engine:        engine,
 		vmConfig:      vmConfig,
 		logger:        vmConfig.Tracer,
+		plugin:        plugin, // Initialize plugin directly
 	}
 	var err error
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
@@ -467,6 +469,10 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis
 	if txLookupLimit != nil {
 		bc.txIndexer = newTxIndexer(*txLookupLimit, bc)
 	}
+	// Initialize plugin if provided
+	if plugin != nil {
+		plugin.OnInit(bc)
+	}
 	return bc, nil
 }
 
@@ -578,6 +584,9 @@ func (bc *BlockChain) SetHead(head uint64) error {
 		log.Error("Current block not found in database", "block", header.Number, "hash", header.Hash())
 		return fmt.Errorf("current block missing: #%d [%x..]", header.Number, header.Hash().Bytes()[:4])
 	}
+	if bc.plugin != nil {
+		bc.plugin.OnHead(header)
+	}
 	bc.chainHeadFeed.Send(ChainHeadEvent{Header: header})
 	return nil
 }
@@ -599,6 +608,9 @@ func (bc *BlockChain) SetHeadWithTimestamp(timestamp uint64) error {
 		log.Error("Current block not found in database", "block", header.Number, "hash", header.Hash())
 		return fmt.Errorf("current block missing: #%d [%x..]", header.Number, header.Hash().Bytes()[:4])
 	}
+	if bc.plugin != nil {
+		bc.plugin.OnHead(header)
+	}
 	bc.chainHeadFeed.Send(ChainHeadEvent{Header: header})
 	return nil
 }
@@ -609,6 +621,9 @@ func (bc *BlockChain) SetFinalized(header *types.Header) {
 	if header != nil {
 		rawdb.WriteFinalizedBlockHash(bc.db, header.Hash())
 		headFinalizedBlockGauge.Update(int64(header.Number.Uint64()))
+		if bc.plugin != nil {
+			bc.plugin.OnFinal(header)
+		}
 	} else {
 		rawdb.WriteFinalizedBlockHash(bc.db, common.Hash{})
 		headFinalizedBlockGauge.Update(0)
@@ -1068,6 +1083,10 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 
 	bc.currentBlock.Store(block.Header())
 	headBlockGauge.Update(int64(block.NumberU64()))
+
+	if bc.plugin != nil {
+		bc.plugin.OnHead(block.Header())
+	}
 }
 
 // stopWithoutSaving stops the blockchain service. If any imports are currently in progress
@@ -1156,6 +1175,9 @@ func (bc *BlockChain) Stop() {
 	// Allow tracers to clean-up and release resources.
 	if bc.logger != nil && bc.logger.OnClose != nil {
 		bc.logger.OnClose()
+	}
+	if bc.plugin != nil {
+		bc.plugin.OnClose()
 	}
 	// Close the trie database, release all the held resources as the last step.
 	if err := bc.triedb.Close(); err != nil {
@@ -1550,6 +1572,9 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 	// Set new head.
 	bc.writeHeadBlock(block)
 
+	if bc.plugin != nil {
+		bc.plugin.OnHead(block.Header())
+	}
 	bc.chainFeed.Send(ChainEvent{Header: block.Header()})
 	if len(logs) > 0 {
 		bc.logsFeed.Send(logs)
@@ -1560,7 +1585,7 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 	// we will fire an accumulated ChainHeadEvent and disable fire
 	// event here.
 	if emitHeadEvent {
-		bc.chainHeadFeed.Send(ChainHeadEvent{Header: block.Header()})
+		bc.plugin.OnHead(block.Header())
 	}
 	return CanonStatTy, nil
 }
@@ -1625,7 +1650,9 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool, makeWitness 
 	// Fire a single chain head event if we've progressed the chain
 	defer func() {
 		if lastCanon != nil && bc.CurrentBlock().Hash() == lastCanon.Hash() {
-			bc.chainHeadFeed.Send(ChainHeadEvent{Header: lastCanon.Header()})
+			if bc.plugin != nil {
+				bc.plugin.OnHead(lastCanon.Header())
+			}
 		}
 	}()
 	// Start the parallel header verifier
@@ -2360,6 +2387,36 @@ func (bc *BlockChain) reorg(oldHead *types.Header, newHead *types.Header) error 
 	// Release the tx-lookup lock after mutation.
 	bc.txLookupLock.Unlock()
 
+	// Trigger revertal reorgs
+	if len(oldChain) > 0 {
+		if bc.plugin != nil {
+			bc.plugin.OnReorg(oldChain, nil)
+		}
+	}
+
+	// Trigger application reorgs
+	if len(newChain) > 1 {
+		slices.Reverse(newChain)
+		if bc.plugin != nil {
+			bc.plugin.OnReorg(newChain[:len(newChain)-1], nil)
+		}
+		slices.Reverse(newChain)
+	}
+
+	// Only trigger plugin hooks if plugin is configured
+	if bc.plugin != nil {
+		if len(oldChain) > 0 || len(newChain) > 1 {
+			var newHeaders []*types.Header
+			if len(newChain) > 1 {
+				// Skip the last header as it's handled separately
+				newHeaders = make([]*types.Header, len(newChain)-1)
+				copy(newHeaders, newChain)
+				slices.Reverse(newHeaders)
+			}
+			bc.plugin.OnReorg(oldChain, newHeaders)
+		}
+	}
+
 	return nil
 }
 
@@ -2408,6 +2465,9 @@ func (bc *BlockChain) SetCanonical(head *types.Block) (common.Hash, error) {
 	bc.chainFeed.Send(ChainEvent{Header: head.Header()})
 	if len(logs) > 0 {
 		bc.logsFeed.Send(logs)
+	}
+	if bc.plugin != nil {
+		bc.plugin.OnHead(head.Header())
 	}
 	bc.chainHeadFeed.Send(ChainHeadEvent{Header: head.Header()})
 
